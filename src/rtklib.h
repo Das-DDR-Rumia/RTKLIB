@@ -37,6 +37,7 @@
 #ifdef WIN32
 #include <winsock2.h>
 #include <windows.h>
+#pragma warning(disable: 4101 4244 4267 4996 4477)
 #else
 #include <pthread.h>
 #endif
