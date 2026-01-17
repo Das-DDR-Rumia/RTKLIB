@@ -35,6 +35,18 @@ static const char rcsid[]="$Id:$";
 #define ERR_CBIAS   0.3         /* code bias error std (m) */
 #define REL_HUMI    0.7         /* relative humidity for saastamoinen model */
 
+#ifdef USE_GD
+#define GD_MAX_ITER    1000000
+#define GD_ALPHA       0.001
+#define GD_TOL         1E-6
+#define GD_ALPHA_DECAY 1.0
+#endif
+
+static int estpos_gd(const obsd_t *obs, int n, const double *rs, const double *dts,
+                     const double *vare, const int *svh, const nav_t *nav,
+                     const prcopt_t *opt, sol_t *sol, double *azel, int *vsat,
+                     double *resp, char *msg);
+
 /* pseudorange measurement error variance ------------------------------------*/
 static double varerr(const prcopt_t *opt, double el, int sys)
 {
@@ -403,11 +415,19 @@ static int raim_fde(const obsd_t *obs, int n, const double *rs,
             svh_e[k++]=svh[j];
         }
         /* estimate receiver position without a satellite */
+#ifdef USE_GD
+        if (!estpos_gd(obs_e,n-1,rs_e,dts_e,vare_e,svh_e,nav,opt,&sol_e,
+                       azel_e,vsat_e,resp_e,msg_e)) {
+            trace(3,"raim_fde: exsat=%2d (%s)\n",obs[i].sat,msg);
+            continue;
+        }
+#else
         if (!estpos(obs_e,n-1,rs_e,dts_e,vare_e,svh_e,nav,opt,&sol_e,azel_e,
                     vsat_e,resp_e,msg_e)) {
             trace(3,"raim_fde: exsat=%2d (%s)\n",obs[i].sat,msg);
             continue;
         }
+#endif
         for (j=nvsat=0,rms_e=0.0;j<n-1;j++) {
             if (!vsat_e[j]) continue;
             rms_e+=SQR(resp_e[j]);
@@ -565,7 +585,11 @@ extern int pntpos(const obsd_t *obs, int n, const nav_t *nav,
     satposs(sol->time,obs,n,nav,opt_.sateph,rs,dts,var,svh);
     
     /* estimate receiver position with pseudorange */
+#ifdef USE_GD
+    stat=estpos_gd(obs,n,rs,dts,var,svh,nav,&opt_,sol,azel_,vsat,resp,msg);
+#else
     stat=estpos(obs,n,rs,dts,var,svh,nav,&opt_,sol,azel_,vsat,resp,msg);
+#endif
     
     /* raim fde */
     if (!stat&&n>=6&&opt->posopt[4]) {
@@ -595,4 +619,242 @@ extern int pntpos(const obsd_t *obs, int n, const nav_t *nav,
     }
     free(rs); free(dts); free(var); free(azel_); free(resp);
     return stat;
+}
+
+/* compute cost function value: J = 0.5 * sum(v[i]^2) ------------------------
+* args   : double *v        I   residual vector (weighted)
+*          int    nv        I   number of residuals
+* return : cost function value
+*-----------------------------------------------------------------------------*/
+static double compute_cost(const double *v, int nv)
+{
+    double cost = 0.0;
+    int i;
+    for (i = 0; i < nv; i++) {
+        cost += v[i] * v[i];
+    }
+    return 0.5 * cost;
+}
+
+/* compute gradient: grad = H^T * v -------------------------------------------
+* args   : double *H        I   design matrix (NX x nv, column-major)
+*          double *v        I   residual vector (weighted)
+*          int    nx        I   number of unknowns
+*          int    nv        I   number of residuals
+*          double *grad     O   gradient vector (nx x 1)
+* return : none
+*-----------------------------------------------------------------------------*/
+static void compute_gradient(const double *H, const double *v, int nx, int nv,
+                             double *grad)
+{
+    int i, j;
+    
+    /* grad = H^T * v */
+    for (i = 0; i < nx; i++) {
+        grad[i] = 0.0;
+        for (j = 0; j < nv; j++) {
+            grad[i] += H[i + j * nx] * v[j];
+        }
+    }
+}
+
+/* gradient descent solver ----------------------------------------------------
+* solve weighted least squares using gradient descent
+* args   : double *H        I   design matrix (nx x nv, column-major, weighted)
+*          double *v        I   residual vector (nv x 1, weighted)
+*          int    nx        I   number of unknowns
+*          int    nv        I   number of observations
+*          double *dx       O   solution vector (nx x 1)
+*          double *Q        O   covariance matrix (nx x nx) - approximate
+* return : status (0:ok, -1:diverged, -2:max iteration reached)
+*-----------------------------------------------------------------------------*/
+static int lsq_gradient_descent(const double *H, const double *v, int nx, int nv,
+                                 double *dx, double *Q)
+{
+    double *grad, *v_temp, *dx_new;
+    double alpha, cost, cost_new, grad_norm;
+    int i, j, iter;
+    
+    trace(3, "lsq_gradient_descent: nx=%d nv=%d\n", nx, nv);
+    
+    /* allocate working memory */
+    grad = mat(nx, 1);
+    v_temp = mat(nv, 1);
+    dx_new = mat(nx, 1);
+    
+    /* initialize solution to zero */
+    for (i = 0; i < nx; i++) dx[i] = 0.0;
+    
+    /* compute initial cost: note v already contains (b - H*x0) */
+    /* we need to track v_current = v_original - H*dx */
+    for (i = 0; i < nv; i++) v_temp[i] = v[i];
+    cost = compute_cost(v_temp, nv);
+    
+    alpha = GD_ALPHA;
+    
+    for (iter = 0; iter < GD_MAX_ITER; iter++) {
+        
+        /* compute gradient: grad = H^T * v_temp */
+        compute_gradient(H, v_temp, nx, nv, grad);
+        
+        /* compute gradient norm for convergence check */
+        grad_norm = norm(grad, nx);
+        
+        trace(4, "gd iter=%4d cost=%12.6f grad_norm=%12.8f alpha=%e\n",
+              iter, cost, grad_norm, alpha);
+        
+        /* check convergence */
+        if (grad_norm < GD_TOL) {
+            trace(3, "gradient descent converged at iter=%d\n", iter);
+            break;
+        }
+        
+        /* gradient descent update: dx_new = dx + alpha * grad */
+        for (i = 0; i < nx; i++) {
+            dx_new[i] = dx[i] + alpha * grad[i];
+        }
+        
+        /* compute new residual: v_temp = v - H * dx_new */
+        for (i = 0; i < nv; i++) {
+            v_temp[i] = v[i];
+            for (j = 0; j < nx; j++) {
+                v_temp[i] -= H[j + i * nx] * dx_new[j];
+            }
+        }
+        
+        /* compute new cost */
+        cost_new = compute_cost(v_temp, nv);
+        
+        /* line search with backtracking */
+        if (cost_new < cost) {
+            /* accept update */
+            for (i = 0; i < nx; i++) dx[i] = dx_new[i];
+            cost = cost_new;
+        } else {
+            /* reduce learning rate and retry */
+            alpha *= 0.5;
+            if (alpha < 1E-15) {
+                trace(2, "gradient descent: learning rate too small\n");
+                break;
+            }
+            continue;
+        }
+        
+        /* apply learning rate decay */
+        alpha *= GD_ALPHA_DECAY;
+    }
+    
+    /* approximate covariance matrix: Q ≈ (H^T * H)^(-1) */
+    /* this requires matrix inversion, use simplified version */
+    for (i = 0; i < nx * nx; i++) Q[i] = 0.0;
+    
+    /* compute H^T * H */
+    for (i = 0; i < nx; i++) {
+        for (j = 0; j < nx; j++) {
+            int k;
+            for (k = 0; k < nv; k++) {
+                Q[i + j * nx] += H[i + k * nx] * H[j + k * nx];
+            }
+        }
+    }
+    
+    /* invert Q using existing RTKLIB function if available */
+    /* for now, just leave H^T*H and note this needs proper inversion */
+    if (matinv(Q, nx) != 0) {
+        trace(2, "warning: covariance matrix inversion failed\n");
+    }
+    
+    free(grad);
+    free(v_temp);
+    free(dx_new);
+    
+    if (iter >= GD_MAX_ITER) {
+        trace(2, "gradient descent: max iteration reached\n");
+        return -2;
+    }
+    
+    return 0;
+}
+
+/* estimate receiver position using gradient descent -------------------------
+* modified version of estpos() that uses gradient descent instead of lsq()
+*-----------------------------------------------------------------------------*/
+static int estpos_gd(const obsd_t *obs, int n, const double *rs, const double *dts,
+                     const double *vare, const int *svh, const nav_t *nav,
+                     const prcopt_t *opt, sol_t *sol, double *azel, int *vsat,
+                     double *resp, char *msg)
+{
+    double x[NX] = {0}, dx[NX], Q[NX * NX], *v, *H, *var, sig;
+    int i, j, k, info, stat, nv, ns;
+    
+    trace(3, "estpos_gd: n=%d\n", n);
+    
+    v = mat(n + 4, 1);
+    H = mat(NX, n + 4);
+    var = mat(n + 4, 1);
+    
+    /* initialize position from previous solution */
+    for (i = 0; i < 3; i++) x[i] = sol->rr[i];
+    
+    for (i = 0; i < MAXITR; i++) {
+        
+        /* compute pseudorange residuals and design matrix */
+        nv = rescode(i, obs, n, rs, dts, vare, svh, nav, x, opt, v, H, var,
+                     azel, vsat, resp, &ns);
+        
+        if (nv < NX) {
+            sprintf(msg, "lack of valid sats ns=%d", nv);
+            break;
+        }
+        
+        /* apply weighting by variance (same as original) */
+        for (j = 0; j < nv; j++) {
+            sig = sqrt(var[j]);
+            v[j] /= sig;
+            for (k = 0; k < NX; k++) H[k + j * NX] /= sig;
+        }
+        
+        /* solve using gradient descent instead of Gauss-Newton */
+        if ((info = lsq_gradient_descent(H, v, NX, nv, dx, Q))) {
+            sprintf(msg, "gradient descent error info=%d", info);
+            /* fall back to normal lsq if gradient descent fails */
+            if ((info = lsq(H, v, NX, nv, dx, Q))) {
+                sprintf(msg, "lsq fallback error info=%d", info);
+                break;
+            }
+        }
+        
+        /* update state vector */
+        for (j = 0; j < NX; j++) x[j] += dx[j];
+        
+        /* check convergence */
+        if (norm(dx, NX) < 1E-4) {
+            sol->type = 0;
+            sol->time = timeadd(obs[0].time, -x[3] / CLIGHT);
+            sol->dtr[0] = x[3] / CLIGHT;  /* receiver clock bias (s) */
+            sol->dtr[1] = x[4] / CLIGHT;  /* glo-gps time offset (s) */
+            sol->dtr[2] = x[5] / CLIGHT;  /* gal-gps time offset (s) */
+            sol->dtr[3] = x[6] / CLIGHT;  /* bds-gps time offset (s) */
+            
+            for (j = 0; j < 6; j++) sol->rr[j] = j < 3 ? x[j] : 0.0;
+            for (j = 0; j < 3; j++) sol->qr[j] = (float)Q[j + j * NX];
+            sol->qr[3] = (float)Q[1];         /* cov xy */
+            sol->qr[4] = (float)Q[2 + NX];    /* cov yz */
+            sol->qr[5] = (float)Q[2];         /* cov zx */
+            sol->ns = (unsigned char)ns;
+            sol->age = sol->ratio = 0.0;
+            
+            /* validate solution */
+            if ((stat = valsol(azel, vsat, n, opt, v, nv, NX, msg))) {
+                sol->stat = opt->sateph == EPHOPT_SBAS ? SOLQ_SBAS : SOLQ_SINGLE;
+            }
+            free(v); free(H); free(var);
+            return stat;
+        }
+    }
+    
+    if (i >= MAXITR) sprintf(msg, "iteration divergent i=%d", i);
+    
+    free(v); free(H); free(var);
+    return 0;
 }
