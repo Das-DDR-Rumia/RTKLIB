@@ -98,6 +98,13 @@ option(ENABLE_BEIDOU "Enable BeiDou" ON)
 option(ENABLE_SBAS "Enable SBAS" ON)
 option(ENABLE_IRNSS "Enable IRNSS" OFF)
 
+option(USE_GD "Enable GD library support" OFF)
+
+if(USE_GD)
+    target_compile_definitions(rtklib PUBLIC USE_GD)
+    target_compile_definitions(rtklib_static PUBLIC USE_GD)
+endif()
+
 # Add definition flags based on options
 if(ENABLE_GLONASS)
     target_compile_definitions(rtklib PUBLIC ENAGLO)
